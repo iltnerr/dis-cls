@@ -5,13 +5,14 @@ import argparse
 import datetime
 import json
 import numpy as np
+import os
 import time
 import torch
 import torch.utils.data
+import uuid
 import warnings
 
 from collections import OrderedDict
-from pathlib import Path
 from PIL import ImageFile
 
 from models.swiftformer import SwiftFormer_XS
@@ -26,8 +27,8 @@ from util.common import common_paths, is_office, init_office_args
 from util.dataset import build_dataset
 from util.engine import train_one_epoch, evaluate
 from util.losses import DistillationLoss
-from util.utils import EarlyStopper, get_rank, get_world_size
-from util.visualization import plot_loss_curves
+from util.utils import init_session
+from util.visualization import plot_learning_curves
 from util.samplers import RASampler
 
 
@@ -38,7 +39,7 @@ warnings.filterwarnings("ignore", message='Palette images with Transparency expr
 def get_args_parser():
     parser = argparse.ArgumentParser('SwiftFormer training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=128, type=int)
-    parser.add_argument('--epochs', default=1000, type=int)
+    parser.add_argument('--epochs', default=150, type=int)
 
     # Model parameters
     parser.add_argument('--model', default='SwiftFormer_XS', type=str, metavar='MODEL', help='Name of model to train')
@@ -65,10 +66,6 @@ def get_args_parser():
     parser.add_argument('--warmup-epochs', type=int, default=5, metavar='N', help='epochs to warmup LR, if scheduler supports')
     parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N', help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
     parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE', help='LR decay rate (default: 0.1)')
-
-    # Early stopper parameters
-    parser.add_argument('--es-patience', default=30, type=int, help='Early stopper patience in terms of epochs (default: 30)')
-    parser.add_argument('--es-delta', default=0.4, type=float, help='Early stopper minimum delta (default: 0.4)')
 
     # Augmentation parameters
     parser.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT', help='Color jitter factor (default: 0.4)')
@@ -113,8 +110,8 @@ def get_args_parser():
 def main(args):
 
     print(args)
+    num_tasks, global_rank = init_session(args.output_dir)
 
-    output_dir = Path(args.output_dir)
     device = torch.device(args.device)
    
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
@@ -123,9 +120,6 @@ def main(args):
     if is_office(): # use subset for development
         dataset_train = torch.utils.data.Subset(dataset_train, torch.arange(0, 6 * args.batch_size))
         dataset_val = torch.utils.data.Subset(dataset_val, torch.arange(0, 2 * args.batch_size))
-
-    num_tasks = get_world_size()
-    global_rank = get_rank()
 
     sampler_train = RASampler(dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True) 
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
@@ -158,7 +152,6 @@ def main(args):
     
     optimizer = create_optimizer(args, model)
     lr_scheduler, _ = create_scheduler(args, optimizer)
-    early_stopper = EarlyStopper(patience=args.es_patience, min_delta=args.es_delta)
     loss_scaler = NativeScaler()
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -190,12 +183,6 @@ def main(args):
     start_time = time.time()
     max_accuracy = 0.0
 
-    # TODO: no need for arrays, metrics are already being logged 
-    valacc_arr  = np.empty(args.epochs)
-    trainloss_arr = np.empty(args.epochs)
-    valloss_arr= np.empty(args.epochs)
-    ep_arr= np.empty(args.epochs)
-
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, 
@@ -203,13 +190,10 @@ def main(args):
             set_training_mode=args.finetune == ''  # keep in eval mode during finetuning
         )
 
-        ep_arr[epoch]=epoch
-        trainloss_arr[epoch]=train_stats["loss"]
-
         lr_scheduler.step(epoch)
 
         if args.output_dir:
-            checkpoint_path = f'{output_dir}/checkpoint.pth'
+            checkpoint_path = f'{args.output_dir}/checkpoint.pth'
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -220,9 +204,6 @@ def main(args):
             }, checkpoint_path)
 
         test_stats = evaluate(data_loader_val, model, device)         
-        valacc_arr[epoch]=test_stats["acc1"]
-        valloss_arr[epoch]=test_stats['loss']   
-
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
         
@@ -232,18 +213,14 @@ def main(args):
                     }
 
         if args.output_dir:
-            with open(f'{output_dir}/log.txt', mode='a') as f:
+            with open(f'{args.output_dir}/log.txt', mode='a') as f:
                 f.write(json.dumps(log_stats) + "\n")
-
-        if early_stopper.early_stop(test_stats["acc1"]):
-            break
-
-    plot_loss_curves(output_dir, ep_arr, trainloss_arr, valloss_arr, valacc_arr)
-    #plot_learning_curves() TODO
     
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+
+    plot_learning_curves(args.output_dir, save_fig=True)
 
 
 if __name__ == '__main__':
@@ -254,6 +231,7 @@ if __name__ == '__main__':
         init_office_args(args)
 
     if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        session_id = '{date:%Y-%m-%d}__'.format(date=datetime.datetime.now()) + uuid.uuid4().hex
+        args.output_dir = os.join(args.output_dir, session_id)
 
     main(args)

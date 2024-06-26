@@ -1,4 +1,6 @@
+import ast
 import datetime
+import os
 import time
 import torch
 import torch.distributed as dist
@@ -188,3 +190,37 @@ def get_rank():
     if not is_dist_avail_and_initialized():
         return 0
     return dist.get_rank()
+
+
+def init_session(local_dir):
+    print("Initializing directories:")
+    for directory in [local_dir]:
+        print(directory)
+        os.makedirs(directory, exist_ok=True)
+
+    num_tasks = get_world_size()
+    global_rank = get_rank()
+    return num_tasks, global_rank
+
+
+def log2dict(logfile):
+    stats = []
+    with open(logfile) as f:
+        for line in f:
+            stats.append(ast.literal_eval(line[:-1])) 
+
+    # split stats
+    stats_dict = {
+        'acc': [], # ACC@1
+        'lr': [], 
+        'train_loss': [], 
+        'test_loss': []
+    }
+
+    for ep in stats:
+        stats_dict['acc'].append(ep['test_acc1'])
+        stats_dict['lr'].append(ep['train_lr'])
+        stats_dict['train_loss'].append(ep['train_loss'])
+        stats_dict['test_loss'].append(ep['test_loss'])
+
+    return stats_dict 
