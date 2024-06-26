@@ -4,7 +4,6 @@ Adapted from https://github.com/Amshaker/SwiftFormer
 import argparse
 import datetime
 import json
-import numpy as np
 import os
 import time
 import torch
@@ -162,7 +161,7 @@ def main(args):
         teacher_model = create_model(
             args.teacher_model,
             pretrained=False,
-            num_classes=1000, # TODO num_classes=20 see below 
+            num_classes=1000,
             global_pool='avg',
         )
 
@@ -232,6 +231,6 @@ if __name__ == '__main__':
 
     if args.output_dir:
         session_id = '{date:%Y-%m-%d}__'.format(date=datetime.datetime.now()) + uuid.uuid4().hex
-        args.output_dir = os.join(args.output_dir, session_id)
+        args.output_dir = os.path.join(args.output_dir, session_id)
 
     main(args)
