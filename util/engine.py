@@ -12,8 +12,8 @@ import util.utils as utils
 from .losses import DistillationLoss
 from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
-from timm.utils import accuracy
-from typing import Iterable
+from timm.utils import accuracy, ModelEma
+from typing import Iterable, Optional
 from util.common import is_office
 
 
@@ -25,6 +25,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     device: torch.device, epoch: int, loss_scaler,
                     clip_grad: float = 0,
                     clip_mode: str = 'norm',
+                    model_ema: Optional[ModelEma] = None,
                     set_training_mode=True):
     
     model.train(set_training_mode)
@@ -60,6 +61,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     parameters=model.parameters(), create_graph=is_second_order)
 
         torch.cuda.synchronize()
+        if model_ema is not None:
+            model_ema.update(model)
 
         metric_logger.update(loss=loss_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
@@ -141,7 +144,7 @@ def evaluate_cm(net, test_loader, save_name, device, output_dir, class_indict):
     classes = list(class_indict.values())
     print("classes",classes)
 
-    cm = confusion_matrix(ytrue, ypred, labels=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19])
+    cm = confusion_matrix(ytrue, ypred, labels=[i for i in range(20)])
     pcm=np.zeros(shape=cm.shape)
     i=0
     j=0
@@ -156,7 +159,7 @@ def evaluate_cm(net, test_loader, save_name, device, output_dir, class_indict):
     plt.ylabel('True', fontsize=14)
     plt.savefig(f'{output_dir}/confusion_matrix.pdf')
 
-    clr = classification_report(y_true, y_pred, labels=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19],target_names=classes, digits=4)
+    clr = classification_report(y_true, y_pred, labels=[i for i in range(20)], target_names=classes, digits=4)
     print("Classification Report:\n----------------------\n", clr)
 
     with open(f'{output_dir}/ClassificationReport.txt', mode='a') as f:

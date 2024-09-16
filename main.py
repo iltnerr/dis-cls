@@ -4,9 +4,11 @@ Adapted from https://github.com/Amshaker/SwiftFormer
 import argparse
 import datetime
 import json
+import numpy as np
 import os
 import time
 import torch
+import torch.backends.cudnn as cudnn
 import torch.utils.data
 import uuid
 import warnings
@@ -20,13 +22,13 @@ from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
-from timm.utils import NativeScaler
+from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from util.common import common_paths, is_office, init_office_args
 from util.dataset import build_dataset
 from util.engine import train_one_epoch, evaluate
 from util.losses import DistillationLoss
-from util.utils import init_session
+from util.utils import init_session, get_rank
 from util.visualization import plot_learning_curves
 from util.samplers import RASampler
 
@@ -43,7 +45,12 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--model', default='SwiftFormer_XS', type=str, metavar='MODEL', help='Name of model to train')
     parser.add_argument('--input-size', default=224,type=int, help='images input size')
-
+    parser.add_argument('--model-ema', action='store_true')
+    parser.add_argument('--no-model-ema', action='store_false', dest='model_ema')
+    parser.set_defaults(model_ema=True)
+    parser.add_argument('--model-ema-decay', type=float, default=0.99996, help='')
+    parser.add_argument('--model-ema-force-cpu', action='store_true', default=False, help='')
+    
     # Optimizer parameters
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER', help='Optimizer (default: "adamw"')
     parser.add_argument('--opt-eps', default=1e-8, type=float, metavar='EPSILON', help='Optimizer Epsilon (default: 1e-8)')
@@ -108,6 +115,12 @@ def get_args_parser():
 
 def main(args):
 
+    # Fix the seed for reproducibility
+    seed = args.seed + get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    cudnn.benchmark = True
+
     print(args)
     num_tasks, global_rank = init_session(args.output_dir)
 
@@ -148,13 +161,25 @@ def main(args):
     )
 
     model.to(device)
+
+    model_ema = None
+    if args.model_ema:
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but
+        # before SyncBN and DDP wrapper
+        model_ema = ModelEma(
+            model,
+            decay=args.model_ema_decay,
+            device='cpu' if args.model_ema_force_cpu else '',
+            resume='')
     
     optimizer = create_optimizer(args, model)
-    lr_scheduler, _ = create_scheduler(args, optimizer)
     loss_scaler = NativeScaler()
+    lr_scheduler, _ = create_scheduler(args, optimizer)
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('Number of trainable parameters:', n_parameters)
+
+    criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
 
     teacher_model = None
     if args.distillation_type != 'none':
@@ -175,7 +200,6 @@ def main(args):
         teacher_model.to(device)
         teacher_model.eval()
 
-    criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     criterion = DistillationLoss(criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau)
 
     print(f"Start training for {args.epochs} epochs")  
@@ -185,7 +209,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, 
-            device, epoch, loss_scaler, args.clip_grad, args.clip_mode, 
+            device, epoch, loss_scaler, args.clip_grad, args.clip_mode, model_ema, 
             set_training_mode=args.finetune == ''  # keep in eval mode during finetuning
         )
 
@@ -198,6 +222,7 @@ def main(args):
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'epoch': epoch,
+                'model_ema': get_state_dict(model_ema) if model_ema is not None else None,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
             }, checkpoint_path)
